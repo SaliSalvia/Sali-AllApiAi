@@ -1,5 +1,16 @@
 package com.example.ui.screens.settings
 
+import android.app.Activity
+import android.content.ClipData
+import android.content.ClipDescription
+import android.content.ClipboardManager
+import android.content.Context
+import android.content.ContextWrapper
+import android.os.Build
+import android.os.PersistableBundle
+import android.view.WindowManager
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
@@ -8,6 +19,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -28,6 +40,9 @@ import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Sync
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -46,12 +61,14 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
@@ -90,6 +107,23 @@ fun SettingsScreen(
     val accountUsage by viewModel.accountUsage.collectAsState()
     val configuredProviders by viewModel.configuredProviders.collectAsState()
     val language by languageRepository.language.collectAsState()
+    val revealedKey by viewModel.revealedHcnsecKey.collectAsState()
+    val revealError by viewModel.revealError.collectAsState()
+    val context = LocalContext.current
+    val activity = remember(context) { context.findActivity() }
+
+    // The full key never survives navigation/backgrounding. Block screenshots and
+    // task-switcher previews only for the brief interval when the key is visible.
+    LifecycleEventEffect(Lifecycle.Event.ON_STOP) { viewModel.hideHcnsecKey() }
+    DisposableEffect(viewModel) { onDispose { viewModel.hideHcnsecKey() } }
+    DisposableEffect(activity, revealedKey) {
+        val window = activity?.window
+        val hadSecureFlag = window?.attributes?.flags?.and(WindowManager.LayoutParams.FLAG_SECURE) != 0
+        if (revealedKey != null) window?.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        onDispose {
+            if (revealedKey != null && !hadSecureFlag) window?.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        }
+    }
     val strings = LocalAppStrings.current
 
     var providerDialog by remember { mutableStateOf<AiProvider?>(null) }
@@ -112,7 +146,10 @@ fun SettingsScreen(
                     )
                 },
                 navigationIcon = {
-                    IconButton(onClick = onNavigateBack) {
+                    IconButton(onClick = {
+                        viewModel.hideHcnsecKey()
+                        onNavigateBack()
+                    }) {
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.ArrowBack,
                             contentDescription = "Back",
@@ -199,12 +236,31 @@ fun SettingsScreen(
                 ConnectionTestState.Idle -> {}
             }
 
+            if (revealError != null) {
+                StatusBanner(ErrorRed, Icons.Default.ErrorOutline, revealError.orEmpty())
+            }
             AiProvider.catalog.forEach { provider ->
                 val configured = provider in configuredProviders
                 ProviderCard(
                     provider = provider,
                     configured = configured,
                     maskedKey = if (configured) viewModel.providerKeyStatus(provider) else null,
+                    revealedKey = if (provider == AiProvider.HCNSEC) revealedKey else null,
+                    onToggleReveal = viewModel::toggleHcnsecKey,
+                    onCopyKey = {
+                        val key = revealedKey
+                        if (key != null) {
+                            val clip = ClipData.newPlainText("HCNSEC API key", key)
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                clip.description.extras = PersistableBundle().apply {
+                                    putBoolean(ClipDescription.EXTRA_IS_SENSITIVE, true)
+                                }
+                            }
+                            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                            clipboard.setPrimaryClip(clip)
+                            viewModel.hideHcnsecKey()
+                        }
+                    },
                     onAdd = {
                         providerDialog = provider
                         providerKeyInput = ""
@@ -512,6 +568,9 @@ private fun ProviderCard(
     provider: AiProvider,
     configured: Boolean,
     maskedKey: String?,
+    revealedKey: String?,
+    onToggleReveal: () -> Unit,
+    onCopyKey: () -> Unit,
     onAdd: () -> Unit,
     onReplace: () -> Unit,
     onTest: () -> Unit,
@@ -560,12 +619,40 @@ private fun ProviderCard(
 
             if (configured && maskedKey != null) {
                 Spacer(modifier = Modifier.height(8.dp))
-                Text(
-                    text = maskedKey,
-                    color = TextSecondary,
-                    fontSize = 12.sp,
-                    fontFamily = FontFamily.Monospace
-                )
+                if (provider == AiProvider.HCNSEC) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            text = revealedKey ?: maskedKey,
+                            color = TextSecondary,
+                            fontSize = 12.sp,
+                            fontFamily = FontFamily.Monospace,
+                            maxLines = 1,
+                            modifier = Modifier.weight(1f).horizontalScroll(rememberScrollState())
+                        )
+                        IconButton(
+                            onClick = onToggleReveal,
+                            modifier = Modifier.testTag("toggle_hcnsec_key_visibility")
+                        ) {
+                            Icon(
+                                if (revealedKey == null) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                                contentDescription = if (revealedKey == null) "Show full HCNSEC key" else "Hide HCNSEC key",
+                                tint = VioletLight
+                            )
+                        }
+                        if (revealedKey != null) {
+                            IconButton(onClick = onCopyKey, modifier = Modifier.testTag("copy_hcnsec_key")) {
+                                Icon(Icons.Default.ContentCopy, contentDescription = "Copy HCNSEC key", tint = VioletLight)
+                            }
+                        }
+                    }
+                    if (revealedKey != null) {
+                        Text("Visible for 30 seconds. Copying places this secret on the device clipboard.",
+                            color = TextSecondary, fontSize = 11.sp)
+                    }
+                } else {
+                    Text(text = maskedKey, color = TextSecondary, fontSize = 12.sp,
+                        fontFamily = FontFamily.Monospace)
+                }
             }
 
             Spacer(modifier = Modifier.height(10.dp))
@@ -617,4 +704,13 @@ private fun ProviderCard(
             }
         }
     }
+}
+
+private fun Context.findActivity(): Activity? {
+    var current: Context? = this
+    while (current != null) {
+        if (current is Activity) return current
+        current = (current as? ContextWrapper)?.baseContext
+    }
+    return null
 }

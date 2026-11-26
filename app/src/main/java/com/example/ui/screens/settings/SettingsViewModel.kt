@@ -10,6 +10,8 @@ import com.example.data.repository.ModelRepository
 import com.example.data.security.ApiKeyRepository
 import com.example.domain.model.AiModel
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -41,6 +43,52 @@ class SettingsViewModel(
     fun isProviderConfigured(provider: AiProvider): Boolean = provider in _configuredProviders.value
 
     fun providerKeyStatus(provider: AiProvider): String = apiKeyRepository.getMaskedProviderKey(provider)
+
+    // The decrypted credential is only held in transient ViewModel memory, never
+    // SavedStateHandle, Room, logs, or Compose saveable state.
+    private val _revealedHcnsecKey = MutableStateFlow<String?>(null)
+    val revealedHcnsecKey = _revealedHcnsecKey.asStateFlow()
+    private val _revealError = MutableStateFlow<String?>(null)
+    val revealError = _revealError.asStateFlow()
+    private var revealTimeout: Job? = null
+    private var revealRequest: Job? = null
+
+    fun toggleHcnsecKey() {
+        if (_revealedHcnsecKey.value != null) {
+            hideHcnsecKey()
+            return
+        }
+        if (revealRequest?.isActive == true) return
+        revealRequest = viewModelScope.launch {
+            _revealError.value = null
+            val key = withContext(Dispatchers.IO) {
+                apiKeyRepository.getProviderKey(AiProvider.HCNSEC)
+            }
+            if (key.isNullOrBlank()) {
+                _revealError.value = "HCNSEC key cannot be decrypted. Do not uninstall the app; check your stored key."
+                return@launch
+            }
+            _revealedHcnsecKey.value = key
+            revealTimeout?.cancel()
+            revealTimeout = viewModelScope.launch {
+                delay(30_000)
+                hideHcnsecKey()
+            }
+        }
+    }
+
+    fun hideHcnsecKey() {
+        revealRequest?.cancel()
+        revealRequest = null
+        revealTimeout?.cancel()
+        revealTimeout = null
+        _revealedHcnsecKey.value = null
+    }
+
+    override fun onCleared() {
+        hideHcnsecKey()
+        super.onCleared()
+    }
 
     fun refreshConfigured() {
         _configuredProviders.value = apiKeyRepository.getConfiguredProviders().toSet()
@@ -77,6 +125,7 @@ class SettingsViewModel(
             result.fold(
                 onSuccess = {
                     try {
+                        if (detectedProvider == AiProvider.HCNSEC) hideHcnsecKey()
                         withContext(Dispatchers.IO) { apiKeyRepository.saveProviderKey(detectedProvider, key) }
                     } catch (e: IllegalStateException) {
                         onError(e.message ?: "Secure storage unavailable")
@@ -93,6 +142,7 @@ class SettingsViewModel(
 
     /** Removes one provider's key; [onAllRemoved] fires only when no provider is left. */
     fun removeProviderKey(provider: AiProvider, onAllRemoved: () -> Unit = {}) {
+        if (provider == AiProvider.HCNSEC) hideHcnsecKey()
         viewModelScope.launch {
             if (provider == AiProvider.CUSTOM) {
                 apiKeyRepository.clearCustomProvider()
@@ -160,6 +210,7 @@ class SettingsViewModel(
     }
 
     fun removeAllKeys(onRemoved: () -> Unit) {
+        hideHcnsecKey()
         viewModelScope.launch {
             AiProvider.catalog.forEach { provider ->
                 if (provider == AiProvider.CUSTOM) {
