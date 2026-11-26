@@ -2,7 +2,7 @@ name: Build Android APK
 
 on:
   push:
-    branches: ["main", "master", "arena/f003f3ad-personal-ai-hcn"]
+    branches: ["main", "master", "arena/**"]
   pull_request:
     branches: ["main", "master"]
   workflow_dispatch:
@@ -70,9 +70,11 @@ jobs:
           touch .env
           if [ -n "${RELEASE_KEYSTORE_BASE64}" ]; then
             echo "Using the keystore provided through repository secrets."
+            echo "SIGNING_MODE=stable" >> "$GITHUB_ENV"
             printf '%s' "${RELEASE_KEYSTORE_BASE64}" | base64 -d > release.keystore
           else
-            echo "No RELEASE_KEYSTORE_BASE64 secret found - generating an ephemeral signing key."
+            echo "No RELEASE_KEYSTORE_BASE64 secret found - generating an ephemeral signing key. NOT AN IN-PLACE UPDATE."
+            echo "SIGNING_MODE=temporary-test" >> "$GITHUB_ENV"
             if [ -z "${STORE_PASSWORD}" ]; then STORE_PASSWORD="$(openssl rand -hex 16)"; fi
             if [ -z "${KEY_PASSWORD}" ]; then KEY_PASSWORD="${STORE_PASSWORD}"; fi
             if [ -z "${KEY_ALIAS}" ]; then KEY_ALIAS="upload"; fi
@@ -147,9 +149,11 @@ jobs:
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Sali-HCNSEC-Release-APK
+          name: Sali-HCNSEC-${{ env.SIGNING_MODE }}-APK
           path: |
             ${{ env.APK_PATH }}
+            apk-sha256.txt
+            apksigner.txt
             app/build/outputs/mapping/release/mapping.txt
           retention-days: 30
           if-no-files-found: error
